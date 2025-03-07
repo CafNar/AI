@@ -1,51 +1,3 @@
-# Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
-#
-#   http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an
-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-# KIND, either express or implied.  See the License for the
-# specific language governing permissions and limitations
-# under the License.
-
-"""
-.. _opt_llm:
-
-Optimize Large Language Model
-=============================
-As large language models (LLMs) have become a popular research topic in many different fields,
-deploying them on cloud and edge devices has become a challenging task. In this tutorial, we will
-demonstrate how to optimize a large language model using Apache TVM. We will use a pre-trained
-TinyLlama model from Hugging Face and deploy it on various devices.
-"""
-
-######################################################################
-# Review Overall Flow
-# -------------------
-# .. figure:: https://raw.githubusercontent.com/tlc-pack/web-data/main/images/design/tvm_overall_flow.svg
-#    :align: center
-#    :width: 80%
-#
-# The overall flow consists of the following steps:
-#
-# - **Construct or Import a Model**: Construct a neural network model or import a pre-trained
-#   model from other frameworks (e.g. PyTorch, ONNX), and create the TVM IRModule, which contains
-#   all the information needed for compilation, including high-level Relax functions for
-#   computational graph, and low-level TensorIR functions for tensor program.
-# - **Perform Composable Optimizations**: Perform a series of optimization transformations,
-#   such as graph optimizations, tensor program optimizations, and library dispatching.
-# - **Build and Universal Deployment**: Build the optimized model to a deployable module to the
-#   universal runtime, and execute it on different devices, such as CPU, GPU, or other accelerators.
-#
-
-
 ######################################################################
 # Construct the model architecture
 # --------------------------------
@@ -70,25 +22,20 @@ from tvm.relax.frontend.nn import Tensor, op
 from tvm.relax.frontend.nn.llm.kv_cache import PagedKVCache, TIRPagedKVCache
 from tvm.runtime import ShapeTuple
 
-######################################################################
-# First, we need to define the model configuration. The configuration includes the key parameters
-# of the model, such as hidden size, intermediate size, etc. Here for convenience, we define a
-# constant config specially for the TinyLlama model.
-
 
 @dataclasses.dataclass
-class LlamaConfig:
-    hidden_size: int = 2048
-    intermediate_size: int = 5632
-    num_attention_heads: int = 32
-    num_hidden_layers: int = 22
-    rms_norm_eps: float = 1e-05
-    vocab_size: int = 32000
-    rope_theta: int = 10000
-    context_window_size: int = 2048
+class QwenConfig:
+    hidden_size: int = 896
+    intermediate_size: int = 4864
+    num_attention_heads: int = 14
+    num_hidden_layers: int = 24
+    rms_norm_eps: float = 1e-06
+    vocab_size: int = 151936
+    rope_theta: float = 1000000.0
+    context_window_size: int = 32768
     prefill_chunk_size: int = 2048
-    num_key_value_heads: int = 4
-    head_dim: int = 64  # hidden_size // num_attention_heads
+    num_key_value_heads: int = 2
+    head_dim: int = 64  # # hidden_size // num_attention_heads
 
 
 dev = tvm.device("cuda", 0)
@@ -138,8 +85,8 @@ class RopeMode(enum.IntEnum):
 #
 
 
-class LlamaFFN(nn.Module):
-    def __init__(self, config: LlamaConfig):
+class QwenFFN(nn.Module):
+    def __init__(self, config: QwenConfig):
         super().__init__()
         self.gate_up_proj = nn.Linear(
             in_features=config.hidden_size,
@@ -170,12 +117,43 @@ class LlamaFFN(nn.Module):
 # - Attention: We leverage the horizontal fusion on attention and fuse the QKV projection and
 
 
-class LlamaAttention(nn.Module):  # pylint: disable=too-many-instance-attributes
-    def __init__(self, config: LlamaConfig):
+# class QwenAttention(nn.Module):  # re-do this function
+#     def __init__(self, config: QwenConfig):
+#         self.head_dim = config.head_dim
+#         self.num_q_heads = config.num_attention_heads
+#         self.num_kv_heads = config.num_key_value_heads
+#         # horizontal fusion on QKV projection
+#         self.qkv_proj = nn.Linear(
+#             in_features=config.hidden_size,
+#             out_features=(self.num_q_heads + 2 * self.num_kv_heads) * self.head_dim,
+#             bias=False,
+#         )
+#         self.o_proj = nn.Linear(self.num_q_heads * self.head_dim, config.hidden_size, bias=False)
+
+#     def forward(self, hidden_states: Tensor, paged_kv_cache: PagedKVCache, layer_id: int):
+#         d, h_q, h_kv = self.head_dim, self.num_q_heads, self.num_kv_heads
+#         b, s, _ = hidden_states.shape
+#         # QKV Projection
+#         qkv = self.qkv_proj(hidden_states)
+#         qkv = op.reshape(qkv, (b, s, h_q + h_kv + h_kv, d))
+#         # Attention
+#         output = op.reshape(
+#             paged_kv_cache.attention_with_fused_qkv(
+#                 layer_id, qkv, self.num_q_heads, sm_scale=self.head_dim**-0.5
+#             ),
+#             (b, s, h_q * d),
+#         )
+#         # Output Projection
+#         return self.o_proj(output)
+
+class QwenAttention(nn.Module):
+    def __init__(self, config: QwenConfig):
+        super().__init__()
         self.head_dim = config.head_dim
         self.num_q_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        # horizontal fusion on QKV projection
+
+        # Tạo lớp Linear để gộp QKV
         self.qkv_proj = nn.Linear(
             in_features=config.hidden_size,
             out_features=(self.num_q_heads + 2 * self.num_kv_heads) * self.head_dim,
@@ -184,31 +162,38 @@ class LlamaAttention(nn.Module):  # pylint: disable=too-many-instance-attributes
         self.o_proj = nn.Linear(self.num_q_heads * self.head_dim, config.hidden_size, bias=False)
 
     def forward(self, hidden_states: Tensor, paged_kv_cache: PagedKVCache, layer_id: int):
-        d, h_q, h_kv = self.head_dim, self.num_q_heads, self.num_kv_heads
         b, s, _ = hidden_states.shape
+        d, h_q, h_kv = self.head_dim, self.num_q_heads, self.num_kv_heads
+
         # QKV Projection
-        qkv = self.qkv_proj(hidden_states)
-        qkv = op.reshape(qkv, (b, s, h_q + h_kv + h_kv, d))
-        # Attention
-        output = op.reshape(
-            paged_kv_cache.attention_with_fused_qkv(
-                layer_id, qkv, self.num_q_heads, sm_scale=self.head_dim**-0.5
-            ),
-            (b, s, h_q * d),
-        )
-        # Output Projection
+        qkv = self.qkv_proj(hidden_states)  # (b, s, (h_q + 2 * h_kv) * d)
+        qkv = op.reshape(qkv, (b, s, h_q + h_kv + h_kv, d))  # (b, s, num_heads, head_dim)
+
+        print("🔍 qkv.shape trước attention_with_fused_qkv:", qkv.shape)
+
+        # Gọi attention_with_fused_qkv
+        attn_output = paged_kv_cache.attention_with_fused_qkv(layer_id, qkv, self.num_q_heads, sm_scale=self.head_dim**-0.5)
+
+        print("🔍 attn_output.shape sau attention_with_fused_qkv:", attn_output.shape)
+
+        # **Reshape lại output đúng kích thước**
+        output = op.reshape(attn_output, (b, s, h_q * d))
+
+        # Output projection
         return self.o_proj(output)
+
+
 
 
 ######################################################################
 # Finally, we define the model architecture with FFN and self-attention layers.
 
 
-class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig):
+class QwenDecoderLayer(nn.Module):
+    def __init__(self, config: QwenConfig):
         rms_norm_eps = config.rms_norm_eps
-        self.self_attn = LlamaAttention(config)
-        self.mlp = LlamaFFN(config)
+        self.self_attn = QwenAttention(config)
+        self.mlp = QwenFFN(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, -1, rms_norm_eps, bias=False)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, -1, rms_norm_eps, bias=False)
 
@@ -220,12 +205,12 @@ class LlamaDecoderLayer(nn.Module):
         return hidden_states
 
 
-class LlamaModel(nn.Module):
-    def __init__(self, config: LlamaConfig):
+class QwenModel(nn.Module):
+    def __init__(self, config: QwenConfig):
         assert config.hidden_size % config.num_attention_heads == 0
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [QwenDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
         self.norm = nn.RMSNorm(config.hidden_size, -1, config.rms_norm_eps, bias=False)
 
@@ -237,9 +222,9 @@ class LlamaModel(nn.Module):
         return hidden_states
 
 
-class LlamaForCasualLM(nn.Module):
-    def __init__(self, config: LlamaConfig):
-        self.model = LlamaModel(config)
+class QwenForCasualLM(nn.Module):
+    def __init__(self, config: QwenConfig):
+        self.model = QwenModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.num_hidden_layers = config.num_hidden_layers
         self.num_attention_heads = config.num_attention_heads
@@ -357,8 +342,8 @@ class LlamaForCasualLM(nn.Module):
 # After defining the model architecture, we can export the model to the Relax IRModule.
 # For demonstration, we only show the part of the model architecture. and parameters.
 
-model_config = LlamaConfig()
-model = LlamaForCasualLM(model_config)
+model_config = QwenConfig()
+model = QwenForCasualLM(model_config)
 model.to("float16")
 mod, named_params = model.export_tvm(spec=model.get_default_spec())
 prefill_str = mod["prefill"].script()
@@ -366,7 +351,7 @@ print(*prefill_str.split("\n")[3:20], sep="\n")  # Only show the first 10 lines 
 print("        ...")
 
 print("\nParameters:")
-pprint(named_params[:5])  # Only show the first 5 parameters for demonstration
+pprint(named_params[:])  # Only show the first 5 parameters for demonstration
 
 ######################################################################
 # Define Optimization Pipeline
@@ -446,8 +431,8 @@ with target:
 
 IS_IN_CI = os.getenv("CI", "") == "true"
 
-HF_WEIGHT_PATH = None
-# HF_WEIGHT_PATH = Path("/path/to/TinyLlama-1.1B-Chat-v1.0/")
+# HF_WEIGHT_PATH = None
+HF_WEIGHT_PATH = Path("/home/an/Downloads/Qwen2.5-0.5B-Instruct")
 
 if not IS_IN_CI:
     import numpy as np
@@ -465,7 +450,11 @@ if not IS_IN_CI:
         for k, v in param_dict.items()
     }
 
+
     named_params = dict(named_params)
+    print("🔍 Model parameters:")
+    for key in param_dict.keys():
+        print(key)
     for i in range(model_config.num_hidden_layers):
         # Add QKV in self attention
         attn = f"model.layers.{i}.self_attn"
@@ -486,12 +475,33 @@ if not IS_IN_CI:
             ],
             axis=0,
         )
+    print("Loaded param_dict keys:", param_dict.keys())
+    print("TVM named_params keys:", named_params.keys())
+    print("🔍 Checking final param_dict keys before accessing lm_head.weight:")
+    for key in param_dict.keys():
+        print(key)
 
     # Convert params into ndarray
+    print("🔍 Checking for lm_head.weight in named_params.keys():")
+    if "lm_head.weight" in named_params.keys():
+        print("✅ lm_head.weight found in named_params")
+    else:
+        print("❌ lm_head.weight is missing in named_params")
+    print("🔍 Checking dtype of lm_head.weight:")
+    
+    if "lm_head.weight" not in param_dict and "model.embed_tokens.weight" in param_dict:
+        param_dict["lm_head.weight"] = param_dict["model.embed_tokens.weight"]
+        print("✅ Assigned lm_head.weight from embed_tokens.weight")
+    import os
+    os.environ["TVM_CUDA_ALLOW_DYNAMIC_SHARED_MEMORY_SIZE"] = "45152"
+
+
     params = [
         tvm.nd.array(param_dict[k].astype("float16"), device=dev) for k in named_params.keys()
     ]
 
+
+    
 
 ######################################################################
 # Deploy the compiled model
